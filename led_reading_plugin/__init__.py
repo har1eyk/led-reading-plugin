@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 # ---- Plugin metadata shown on the Plugins page (follow Pioreactor style)
 __plugin_name__ = "led_reading_plugin"
-__plugin_version__ = "0.1.4"
+__plugin_version__ = "0.1.5"
 __plugin_summary__ = (
     "Uses a non-IR LED + a photodiode to take periodic measurements; averages N"
     " samples in a short burst and stores the result."
