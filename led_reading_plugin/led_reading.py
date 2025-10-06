@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from time import sleep, time
-from typing import Optional, cast
+from typing import Optional, Sequence, cast
 from datetime import datetime
 
 import click
@@ -48,6 +48,7 @@ def _ensure_table() -> None:
         led_reading REAL NOT NULL,
         angle INTEGER NOT NULL,
         channel INTEGER NOT NULL CHECK (channel IN (1, 2)),
+        pd_channel INTEGER NOT NULL CHECK (pd_channel IN (1, 2)) DEFAULT 1,
         FOREIGN KEY (experiment) REFERENCES experiments(experiment) ON DELETE CASCADE
     );
     """
@@ -58,6 +59,13 @@ def _ensure_table() -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(ddl_1)
         conn.execute(ddl_2)
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(led_automation_readings)").fetchall()
+        }
+        if "pd_channel" not in existing_cols:
+            print(f"[{_now()}] Adding pd_channel column to led_automation_readings.", flush=True)
+            conn.execute("ALTER TABLE led_automation_readings ADD COLUMN pd_channel INTEGER DEFAULT 1;")
+            conn.execute("UPDATE led_automation_readings SET pd_channel = 1 WHERE pd_channel IS NULL;")
 
 
 class SimpleADC:
@@ -145,6 +153,8 @@ class LEDReader(BackgroundJob):
         "led_channel": {"datatype": "string", "settable": False},
         "last_burst_avg": {"datatype": "float", "settable": False, "unit": "V"},
         "angle": {"datatype": "integer", "settable": False},
+        "pd_channels": {"datatype": "string", "settable": False},
+        "last_burst_avgs": {"datatype": "string", "settable": False},
     }
 
     def __init__(
@@ -152,7 +162,7 @@ class LEDReader(BackgroundJob):
         unit: pt.Unit,
         experiment: pt.Experiment,
         interval: float,
-        pd_channel: pt.PdChannel = "1",
+        pd_channels: Optional[Sequence[pt.PdChannel]] = None,
         led_name: str = "orange1",
         led_channel: Optional[pt.LedChannel] = None,
         led_intensity_percent: Optional[float] = None,
@@ -199,21 +209,71 @@ class LEDReader(BackgroundJob):
         self.target_samples = int(target_samples)
         self.fake_data = fake_data
 
-        # Angle from od_config.photodiode_channel.1 (e.g., "180")
-        angle_str = config.get("od_config.photodiode_channel", "1", fallback=None)
-        if angle_str is None:
-            print(
-                f"[{_now()}] ERROR: Missing [od_config.photodiode_channel] 1=ANGLE (e.g., 180).",
-                flush=True,
-            )
+        # Determine which photodiode channels to read.
+        raw_channels = list(pd_channels) if pd_channels else ["1"]
+        normalized_channels: list[str] = []
+        for raw in raw_channels:
+            token = str(raw).strip()
+            if token.lower().startswith("pd"):
+                token = token[2:]
+            token = token.strip()
+            if token not in {"1", "2"}:
+                print(f"[{_now()}] ERROR: Unsupported photodiode channel '{raw}'.", flush=True)
+                self.clean_up()
+                raise ValueError("Only photodiode channels '1' and '2' are supported.")
+            if token not in normalized_channels:
+                normalized_channels.append(token)
+        if not normalized_channels:
+            print(f"[{_now()}] ERROR: No photodiode channels provided.", flush=True)
             self.clean_up()
-            raise ValueError("Angle for PD channel 1 is required in config.")
-        try:
-            self.angle = int(angle_str)
-        except Exception:
-            print(f"[{_now()}] ERROR: Angle for PD1 must be integer. Got: {angle_str}", flush=True)
-            self.clean_up()
-            raise
+            raise ValueError("At least one photodiode channel must be provided.")
+
+        self.pd_channel_list = normalized_channels
+        self.primary_pd_channel = self.pd_channel_list[0]
+        # Publish-friendly string for UI/monitoring.
+        self.pd_channels = ",".join(self.pd_channel_list)
+
+        # Per-channel angle metadata
+        self.pd_angle_map: dict[str, int] = {}
+        self.pd_angle_label_map: dict[str, str] = {}
+
+        for pd_ch in self.pd_channel_list:
+            angle_str = config.get("od_config.photodiode_channel", pd_ch, fallback=None)
+            if angle_str is None:
+                print(
+                    f"[{_now()}] ERROR: Missing [od_config.photodiode_channel] {pd_ch}=ANGLE (e.g., 180).",
+                    flush=True,
+                )
+                self.clean_up()
+                raise ValueError(f"Angle for PD channel {pd_ch} is required in config.")
+            angle_str = angle_str.strip()
+            if not angle_str:
+                print(f"[{_now()}] ERROR: Angle for PD{pd_ch} is blank in config.", flush=True)
+                self.clean_up()
+                raise ValueError(f"Angle for PD channel {pd_ch} cannot be blank.")
+
+            if angle_str.upper() == "REF":
+                angle_val = -1  # sentinel representing the reference photodiode
+                angle_label = "REF"
+                print(f"[{_now()}] Using PD{pd_ch} as reference photodiode (angle sentinel -1).", flush=True)
+            else:
+                try:
+                    angle_val = int(angle_str)
+                    angle_label = angle_str
+                except Exception:
+                    print(
+                        f"[{_now()}] ERROR: Angle for PD{pd_ch} must be integer or 'REF'. Got: {angle_str}",
+                        flush=True,
+                    )
+                    self.clean_up()
+                    raise
+
+            self.pd_angle_map[pd_ch] = angle_val
+            self.pd_angle_label_map[pd_ch] = angle_label
+
+        # Primary (first) PD channel retained for backwards compatibility.
+        self.angle = self.pd_angle_map[self.primary_pd_channel]
+        self.angle_label = self.pd_angle_label_map[self.primary_pd_channel]
 
         # Summarize configuration
         print(
@@ -225,14 +285,21 @@ class LEDReader(BackgroundJob):
             f"[{_now()}] LED: name='{led_name}', channel={self.led_channel}, intensity={self.led_intensity}%",
             flush=True,
         )
-        print(f"[{_now()}] PD channel=1 (PD585), angle={self.angle}", flush=True)
+        pd_summary = ", ".join(
+            f"PD{ch}=angle:{self.pd_angle_label_map[ch]}" for ch in self.pd_channel_list
+        )
+        print(f"[{_now()}] PD channels -> {pd_summary}", flush=True)
         print(f"[{_now()}] SQLite DB: {DB_PATH}", flush=True)
 
         # Ensure table exists up-front
         _ensure_table()
 
-        # ADC for PD1
-        self.adc = SimpleADC(pd_channel, dynamic_gain=not fake_data)
+        # ADC handles for each PD channel
+        self.adcs = {
+            pd_ch: SimpleADC(pd_ch, dynamic_gain=not fake_data) for pd_ch in self.pd_channel_list
+        }
+        self.last_burst_avgs_dict: dict[str, float] = {pd_ch: 0.0 for pd_ch in self.pd_channel_list}
+        self.last_burst_avgs = json.dumps(self.last_burst_avgs_dict)
 
         # Start periodic runner (immediate first run)
         print(f"[{_now()}] Starting periodic bursts (first run immediately)...", flush=True)
@@ -280,7 +347,7 @@ class LEDReader(BackgroundJob):
         - write to DB + publish MQTT
         """
         print(f"[{_now()}] --- Burst start ---", flush=True)
-        samples: list[float] = []
+        samples: dict[str, list[float]] = {pd_ch: [] for pd_ch in self.pd_channel_list}
         try:
             with led_utils.change_leds_intensities_temporarily(
                 {self.led_channel: self.led_intensity},
@@ -302,64 +369,112 @@ class LEDReader(BackgroundJob):
                     flush=True,
                 )
 
-                while (time() - t0) < self.burst_seconds and len(samples) < self.target_samples:
-                    v = self.adc.read_voltage()
-                    samples.append(v)
+                while (time() - t0) < self.burst_seconds and (
+                    max((len(vals) for vals in samples.values()), default=0) < self.target_samples
+                ):
+                    for pd_ch in self.pd_channel_list:
+                        adc = self.adcs[pd_ch]
+                        v = adc.read_voltage()
+                        samples[pd_ch].append(v)
+                        adc.check_on_gain(v)
                     sleep(target_dt)
         except Exception as e:
             print(f"[{_now()}] ERROR during sampling: {e}", flush=True)
 
         # compute average
-        if samples:
-            avg_v = sum(samples) / len(samples)
-            mn = min(samples)
-            mx = max(samples)
-        else:
-            avg_v = 0.0
-            mn = mx = 0.0
+        stats: dict[str, dict[str, float]] = {}
+        for pd_ch in self.pd_channel_list:
+            values = samples.get(pd_ch, [])
+            if values:
+                avg_v = sum(values) / len(values)
+                mn = min(values)
+                mx = max(values)
+            else:
+                avg_v = 0.0
+                mn = mx = 0.0
+            stats[pd_ch] = {
+                "avg": float(avg_v),
+                "min": float(mn),
+                "max": float(mx),
+                "n": len(values),
+            }
 
-        self.last_burst_avg = float(avg_v)
-        print(
-            f"[{_now()}] Samples collected: {len(samples)}  "
-            f"min={mn:.4f}V  max={mx:.4f}V  avg={avg_v:.4f}V",
-            flush=True,
-        )
+        self.last_burst_avgs_dict = {pd_ch: stats[pd_ch]["avg"] for pd_ch in self.pd_channel_list}
+        self.last_burst_avgs = json.dumps(self.last_burst_avgs_dict)
+        primary_stats = stats.get(self.primary_pd_channel, {"avg": 0.0})
+        self.last_burst_avg = float(primary_stats.get("avg", 0.0))
 
-        # persist → SQLite
+        summary_bits = [
+            (
+                f"PD{pd_ch}: samples={stats[pd_ch]['n']} "
+                f"min={stats[pd_ch]['min']:.4f}V max={stats[pd_ch]['max']:.4f}V avg={stats[pd_ch]['avg']:.4f}V"
+            )
+            for pd_ch in self.pd_channel_list
+        ]
+        print(f"[{_now()}] Samples collected -> {'; '.join(summary_bits)}", flush=True)
+
+        # persist -> SQLite
         ts = current_utc_datetime()
         try:
             with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-                conn.execute(
-                    "INSERT INTO led_automation_readings "
-                    "(experiment, pioreactor_unit, timestamp, led_reading, angle, channel) "
-                    "VALUES (?, ?, ?, ?, ?, ?);",
-                    (
-                        self.experiment,
-                        self.unit,
-                        ts,
-                        float(avg_v),
-                        int(self.angle),
+                inserted_rows: list[str] = []
+                for pd_ch in self.pd_channel_list:
+                    channel_stats = stats[pd_ch]
+                    if channel_stats["n"] == 0:
+                        continue
+                    conn.execute(
+                        "INSERT INTO led_automation_readings "
+                        "(experiment, pioreactor_unit, timestamp, led_reading, angle, channel, pd_channel) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?);",
+                        (
+                            self.experiment,
+                            self.unit,
+                            ts,
+                            channel_stats["avg"],
+                            int(self.pd_angle_map[pd_ch]),
                         2 if self.led_channel == "B" else (1 if self.led_channel == "A" else 2),
-                    ),
+                            int(pd_ch),
+                        ),
+                    )
+                    inserted_rows.append(
+                        f"PD{pd_ch}:avg={channel_stats['avg']:.6f} angle={self.pd_angle_label_map[pd_ch]}"
+                    )
+            if inserted_rows:
+                print(
+                    f"[{_now()}] DB insert OK -> led_automation_readings "
+                    f"(ts={ts}, {', '.join(inserted_rows)})",
+                    flush=True,
                 )
-            print(
-                f"[{_now()}] DB insert OK → led_automation_readings "
-                f"(ts={ts}, avg={avg_v:.6f}, angle={self.angle}, chan={'2' if self.led_channel=='B' else '1'})",
-                flush=True,
-            )
+            else:
+                print(f"[{_now()}] WARNING: No samples collected; nothing inserted into DB.", flush=True)
         except Exception as e:
             print(f"[{_now()}] ERROR: Failed to write to DB: {e}", flush=True)
 
         # publish compact MQTT payload (optional)
         try:
+            payload_channels = {
+                pd_ch: {
+                    "avg_voltage": stats[pd_ch]["avg"],
+                    "min_voltage": stats[pd_ch]["min"],
+                    "max_voltage": stats[pd_ch]["max"],
+                    "n_samples": int(stats[pd_ch]["n"]),
+                    "angle": int(self.pd_angle_map[pd_ch]),
+                    "angle_label": self.pd_angle_label_map[pd_ch],
+                }
+                for pd_ch in self.pd_channel_list
+            }
+            primary_pd_stats = payload_channels.get(self.primary_pd_channel, {})
             payload = json.dumps(
                 {
                     "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
-                    "avg_voltage": float(avg_v),
+                    "avg_voltage": float(primary_pd_stats.get("avg_voltage", 0.0)),
                     "angle": int(self.angle),
+                    "angle_label": self.angle_label,
                     "channel": self.led_channel,
+                    "pd_channel": self.primary_pd_channel,
                     "intensity_percent": self.led_intensity,
-                    "n_samples": len(samples),
+                    "n_samples": int(primary_pd_stats.get("n_samples", 0)),
+                    "pd_channels": payload_channels,
                 }
             )
             publish(
@@ -388,6 +503,7 @@ def start_led_reading(
     led_name: Optional[str] = None,
     led_channel: Optional[pt.LedChannel] = None,
     led_intensity_percent: Optional[float] = None,
+    pd_channels: Optional[Sequence[pt.PdChannel]] = None,
 ) -> LEDReader:
     """Convenience bootstrapper."""
     unit = unit or whoami.get_unit_name()
@@ -403,9 +519,36 @@ def start_led_reading(
     target_samples = config.getint("led_reading.config", "target_samples", fallback=12)
     led_name = led_name or config.get("led_reading.config", "led_name", fallback="orange1")
 
+    resolved_pd_channels: list[str]
+    if pd_channels:
+        resolved_pd_channels = [str(ch).strip() for ch in pd_channels if str(ch).strip()]
+    else:
+        pd_channels_cfg = config.get("led_reading.config", "pd_channels", fallback=None)
+        if pd_channels_cfg:
+            tokens = []
+            for chunk in pd_channels_cfg.replace(";", ",").replace("|", ",").split(","):
+                token = chunk.strip()
+                if token.lower().startswith("pd"):
+                    token = token[2:].strip()
+                if token:
+                    tokens.append(token)
+            resolved_pd_channels = tokens if tokens else ["1"]
+        else:
+            resolved_pd_channels = ["1"]
+
+    # Deduplicate while preserving order
+    deduped: list[str] = []
+    for token in resolved_pd_channels:
+        if token not in deduped:
+            deduped.append(token)
+    if not deduped:
+        deduped = ["1"]
+    resolved_pd_channels = deduped
+
     print(
         f"[{_now()}] start_led_reading(): interval={interval}s, settle_ms={settle_ms}, "
-        f"burst_seconds={burst_seconds}, target_samples={target_samples}, led_name={led_name}",
+        f"burst_seconds={burst_seconds}, target_samples={target_samples}, led_name={led_name}, "
+        f"pd_channels={resolved_pd_channels}",
         flush=True,
     )
 
@@ -413,7 +556,6 @@ def start_led_reading(
         unit=unit,
         experiment=experiment,
         interval=float(interval),
-        pd_channel="1",
         led_name=led_name,
         led_channel=led_channel,
         led_intensity_percent=led_intensity_percent,
@@ -421,6 +563,7 @@ def start_led_reading(
         burst_seconds=burst_seconds,
         target_samples=target_samples,
         fake_data=fake_data or whoami.is_testing_env(),
+        pd_channels=resolved_pd_channels,
     )
 
 # led_reading_plugin/led_reading.py
@@ -435,7 +578,14 @@ from pioreactor.cli.run import run
               help="name as defined in [leds]/[leds_reverse] (e.g., orange1)")
 @click.option("--led-intensity", type=click.FLOAT, default=None, show_default=True,
               help="override LED intensity percent for this run (otherwise from config)")
-def led_reading(interval, fake_data, led_name, led_intensity):
+@click.option(
+    "--pd-channel",
+    "pd_channels",
+    type=click.Choice(["1", "2"], case_sensitive=False),
+    multiple=True,
+    help="Specify PD channel(s) to sample (repeat for multiples). Default uses config or PD1.",
+)
+def led_reading(interval, fake_data, led_name, led_intensity, pd_channels):
     # Call your existing start function
     from .led_reading import start_led_reading  # if start_led_reading is in this same file, this import is optional
     with start_led_reading(
@@ -443,6 +593,7 @@ def led_reading(interval, fake_data, led_name, led_intensity):
         fake_data=fake_data,
         led_name=led_name,
         led_intensity_percent=led_intensity,
+        pd_channels=pd_channels if pd_channels else None,
     ) as job:
         job.block_until_disconnected()
 # --- compatibility for loaders expecting a `click_...` symbol ---
