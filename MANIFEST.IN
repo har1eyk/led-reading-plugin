@@ -1,0 +1,2 @@
+include led_reading_plugin/additional_sql.sql
+recursive-include led_reading_plugin/ui *.yaml

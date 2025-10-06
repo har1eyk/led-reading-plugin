@@ -1,0 +1,50 @@
+---
+display_name: LED Readings
+job_name: led_reading           
+display: true                   # show on the Pioreactors card
+source: led_reading_plugin      # label shown in the UI
+description: Periodic LED-driven PD sampling that averages a short burst and writes to led_automation_readings table.
+published_settings:
+  - key: interval
+    unit: s
+    label: Burst interval
+    description: Seconds between LED bursts
+    type: numeric
+    default: null
+    display: true
+  - key: led_intensity
+    unit: "%"
+    label: LED intensity (B)
+    description: Intensity used for bursts
+    type: numeric
+    default: 70
+    display: true
+  - key: angle
+    unit: deg
+    label: PD1 angle
+    description: Angle associated with PD1
+    type: numeric
+    default: 180
+    display: true
+  - key: last_burst_avg
+    unit: V
+    label: Last burst (avg)
+    description: Average voltage from last burst
+    type: numeric
+    default: null
+    display: true
+
+
+
+# description: |
+#   This plugin uses an LED and a photodiode (PD) to take periodic measurements.
+#   The PD is placed in position 1, the same as the IR PD*. This setup can be used
+#   to measure OD at a different wavelength with a different LED and PD, or to take
+#   fluorescent measurements. Users should specify a name (e.g., "orange1") with its
+#   position in the [leds] field. The [od_config.photodiode_channel] should be modified
+#   so that 1=REF is changed to the angle of the LED, e.g. 180.
+  
+#   *Optical density (OD) measurements will not include a REF value.
+
+
+# We intentionally do not expose live-settable published settings here per spec.

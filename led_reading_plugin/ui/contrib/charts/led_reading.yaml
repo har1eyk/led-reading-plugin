@@ -1,0 +1,8 @@
+---
+chart_key: led_reading
+display_name: LED reading (avg voltage)
+description: Real‑time averaged LED/PD readings from led_reading
+series:
+- label: avg_voltage
+topic: pioreactor/+/+/led_reading/+
+json_path: $.avg_voltage
