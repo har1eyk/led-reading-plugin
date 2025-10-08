@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="led-reading-plugin",
-    version="0.1.5",
+    version="0.1.6",
     description="Periodic LED readings for Pioreactor",
     author="Harley King",
     packages=find_packages(),

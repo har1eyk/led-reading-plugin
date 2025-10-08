@@ -532,8 +532,17 @@ def start_led_reading(
                     token = token[2:].strip()
                 if token:
                     tokens.append(token)
-            resolved_pd_channels = tokens if tokens else ["1"]
+            resolved_pd_channels = tokens if tokens else []
         else:
+            resolved_pd_channels = []
+
+        # If still empty, fall back to PD channels defined in od_config.photodiode_channel
+        if not resolved_pd_channels and config.has_section("od_config.photodiode_channel"):
+            for candidate in ("1", "2"):
+                if config.has_option("od_config.photodiode_channel", candidate):
+                    resolved_pd_channels.append(candidate)
+
+        if not resolved_pd_channels:
             resolved_pd_channels = ["1"]
 
     # Deduplicate while preserving order
